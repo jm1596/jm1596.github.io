@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { fnv1a } from "./lib/library";
+import { parseCluesFromFile, parseCluesFromText } from "./lib/csv";
 
 // --- Types ---
 type Clue = {
@@ -21,103 +23,6 @@ type SavedState = {
   };
   lastIndex: number;
 };
-
-// --- Simple CSV parser ---
-async function parseCSV(file: File): Promise<Clue[]> {
-  const text = await file.text();
-  // Try PapaParse if present
-  const hasPapa = (window as any).Papa || null;
-  if (hasPapa) {
-    return new Promise((resolve, reject) => {
-      (window as any).Papa.parse(text, {
-        header: true,
-        skipEmptyLines: true,
-        transformHeader: (h: string) => h.trim().toLowerCase(),
-        complete: (res: any) => {
-          const rows = (res.data || []) as any[];
-          const clues: Clue[] = rows.map((r) => ({
-            topic: (r.topic ?? "").toString(),
-            money: r.money === "" || r.money == null ? "" : r.money,
-            question: (r.question ?? "").toString(),
-            answer: (r.answer ?? "").toString(),
-          }));
-          resolve(clues);
-        },
-        error: (err: any) => reject(err),
-      });
-    });
-  }
-
-  // Fallback parser
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  if (lines.length === 0) return [];
-  const header = splitCSVLine(lines[0]).map((h) => h.trim().toLowerCase());
-  const idxTopic = header.indexOf("topic");
-  const idxMoney = header.indexOf("money");
-  const idxQuestion = header.indexOf("question");
-  const idxAnswer = header.indexOf("answer");
-
-  const data: Clue[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = splitCSVLine(lines[i]);
-    data.push({
-      topic: cols[idxTopic] ?? "",
-      money: cols[idxMoney] ?? "",
-      question: cols[idxQuestion] ?? "",
-      answer: cols[idxAnswer] ?? "",
-    });
-  }
-  return data;
-}
-
-function splitCSVLine(line: string): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (line[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        cur += ch;
-      }
-    } else {
-      if (ch === ',') {
-        out.push(cur);
-        cur = "";
-      } else if (ch === '"') {
-        inQuotes = true;
-      } else {
-        cur += ch;
-      }
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
-function toCSV(rows: any[], headers: string[]): string {
-  const esc = (val: any) => {
-    const s = val == null ? "" : String(val);
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  return [headers.join(","), ...rows.map((r) => headers.map((h) => esc(r[h])).join(","))].join("\n");
-}
-
-function fnv1a(str: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
-  }
-  return ("0000000" + h.toString(16)).slice(-8);
-}
 
 // --- Helpers (top-level so they can be used by child components) ---
 function moneyToNumber(m: string | number | null | undefined): number {
@@ -146,7 +51,23 @@ const CATEGORIES = [
   "Misc",
 ];
 
-export default function App() {
+type AppProps = {
+  initialFileText?: string;
+  initialAnnotations?: Record<number, Annotation>;
+  initialSettings?: { shuffle: boolean; reviewOnly: boolean };
+  initialLastIndex?: number;
+  readOnlyHeader?: boolean;
+  onStateChange?: (state: SavedState) => void;
+};
+
+export default function App({
+  initialFileText,
+  initialAnnotations,
+  initialSettings,
+  initialLastIndex,
+  readOnlyHeader,
+  onStateChange,
+}: AppProps) {
   const [fileText, setFileText] = useState<string>("");
   const [clues, setClues] = useState<Clue[]>([]);
   const [annotations, setAnnotations] = useState<Record<number, Annotation>>({});
@@ -155,9 +76,9 @@ export default function App() {
   const [shuffle, setShuffle] = useState<boolean>(false);
   const [reviewOnly, setReviewOnly] = useState<boolean>(false);
   const [order, setOrder] = useState<number[]>([]);
-  const [showSettings, setShowSettings] = useState<boolean>(false);
   const categories = CATEGORIES;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isControlled = initialFileText != null;
 
   const storageKey = useMemo(() => {
     if (!fileText) return "jarchiveFlashcards:__none__";
@@ -203,16 +124,19 @@ export default function App() {
 
   useEffect(() => {
     setOrder(activeIndices);
-    setIdx(0);
+    if (!isControlled) {
+      setIdx(0);
+    }
     setRevealed(false);
-  }, [fileText, reviewOnly, shuffle, activeIndices.length]);
+  }, [fileText, reviewOnly, shuffle, activeIndices.length, isControlled]);
 
   const total = order.length;
   const currentIndex = order[idx] ?? 0;
   const currentAnn = annotations[currentIndex] || { review: false, category: categories[0] };
 
+  // Load from localStorage only when not controlled
   useEffect(() => {
-    if (!fileText) return;
+    if (!fileText || isControlled) return;
     try {
       const raw = localStorage.getItem(storageKey);
       if (raw) {
@@ -223,7 +147,22 @@ export default function App() {
         setIdx(Math.min(saved.lastIndex ?? 0, Math.max(0, (saved.annotations ? Object.keys(saved.annotations).length : 0))));
       }
     } catch { /* ignore */ }
-  }, [storageKey, fileText]);
+  }, [storageKey, fileText, isControlled]);
+
+  // Controlled initial load from props
+  useEffect(() => {
+    if (!isControlled) return;
+    if (!initialFileText) return;
+    setFileText(initialFileText);
+    // parse from text
+    parseCluesFromText(initialFileText).then((rows) => setClues(rows));
+    if (initialAnnotations) setAnnotations(initialAnnotations);
+    if (initialSettings) {
+      setShuffle(!!initialSettings.shuffle);
+      setReviewOnly(!!initialSettings.reviewOnly);
+    }
+    if (typeof initialLastIndex === "number") setIdx(Math.max(0, initialLastIndex));
+  }, [isControlled, initialFileText]);
 
   useEffect(() => {
     if (!fileText) return;
@@ -232,11 +171,14 @@ export default function App() {
       settings: { shuffle, reviewOnly },
       lastIndex: idx,
     };
-    // Note: localStorage not available in Claude artifacts environment
+    if (isControlled) {
+      onStateChange?.(state);
+      return;
+    }
     try {
       localStorage.setItem(storageKey, JSON.stringify(state));
     } catch { /* ignore */ }
-  }, [annotations, shuffle, reviewOnly, idx, storageKey, fileText]);
+  }, [annotations, shuffle, reviewOnly, idx, storageKey, fileText, isControlled, onStateChange]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -272,13 +214,12 @@ export default function App() {
     const f = e.target.files?.[0];
     if (!f) return;
     f.text().then((t) => setFileText(t));
-    parseCSV(f)
+    parseCluesFromFile(f)
       .then((rows) => {
         setClues(rows);
         setIdx(0);
         setRevealed(false);
         setAnnotations({});
-        setShowSettings(false);
       })
       .catch((err) => {
         alert("Failed to parse CSV: " + err);
@@ -313,38 +254,6 @@ export default function App() {
     }));
   }
 
-  function exportCSV(onlyMarked: boolean) {
-    const rows = (onlyMarked ? order.filter((i) => annotations[i]?.review) : order).map((i) => ({
-      topic: clues[i]?.topic ?? "",
-      money: clues[i]?.money ?? "",
-      question: clues[i]?.question ?? "",
-      answer: clues[i]?.answer ?? "",
-      chosen_category: annotations[i]?.category ?? "",
-      marked_for_review: annotations[i]?.review ? "true" : "false",
-      original_index: i,
-    }));
-    const headers = ["topic", "money", "question", "answer", "chosen_category", "marked_for_review", "original_index"];
-    const csv = toCSV(rows, headers);
-    downloadText(csv, onlyMarked ? `jarchive_marked_${dateStamp()}.csv` : `jarchive_all_${dateStamp()}.csv`);
-  }
-
-  function downloadText(text: string, filename: string) {
-    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  // (moved to top-level)
-
-  function dateStamp() {
-    const d = new Date();
-    return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0"), "-", String(d.getHours()).padStart(2, "0"), String(d.getMinutes()).padStart(2, "0")].join("");
-  }
-
   function resetAnnotations() {
     if (!confirm("Clear marks and categories for this file?")) return;
     setAnnotations({});
@@ -356,89 +265,15 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
-      {/* Header */}
-      <header className="bg-white shadow-sm border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
-          <h1 className="text-3xl font-bold text-slate-800">J-Archive Flashcards</h1>
-          <div className="flex items-center gap-3">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".csv"
-              className="hidden"
-              onChange={handleFile}
-            />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium shadow-sm"
-            >
-              {clues.length ? "Load New" : "Load CSV"}
-            </button>
-            {clues.length > 0 && (
-              <button
-                onClick={() => setShowSettings(!showSettings)}
-                className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-colors"
-              >
-                Settings
-              </button>
-            )}
-            {/* Topic selection removed per requirements */}
-          </div>
-        </div>
-      </header>
-
-      {/* Topic selection UI removed per requirements */}
-
-      {/* Settings Panel */}
-      {showSettings && clues.length > 0 && (
-        <div className="bg-white border-b border-slate-200 shadow-sm">
-          <div className="max-w-6xl mx-auto px-6 py-4">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
-              <div className="flex flex-col gap-3">
-                <label className="flex items-center gap-3 text-sm">
-                  <input 
-                    type="checkbox" 
-                    className="accent-blue-600 w-4 h-4" 
-                    checked={shuffle} 
-                    onChange={(e) => setShuffle(e.target.checked)} 
-                  />
-                  <span className="font-medium text-slate-700">Shuffle Order</span>
-                </label>
-                <label className="flex items-center gap-3 text-sm">
-                  <input 
-                    type="checkbox" 
-                    className="accent-blue-600 w-4 h-4" 
-                    checked={reviewOnly} 
-                    onChange={(e) => setReviewOnly(e.target.checked)} 
-                  />
-                  <span className="font-medium text-slate-700">Review Only</span>
-                </label>
-              </div>
-              <div>
-                <button 
-                  onClick={resetAnnotations} 
-                  className="px-4 py-2 bg-red-50 text-red-700 rounded-lg hover:bg-red-100 transition-colors text-sm font-medium"
-                >
-                  Clear All Marks
-                </button>
-              </div>
-              <div className="flex gap-3">
-                <button 
-                  onClick={() => exportCSV(false)} 
-                  className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-colors text-sm font-medium"
-                >
-                  Export All
-                </button>
-                <button 
-                  onClick={() => exportCSV(true)} 
-                  className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm font-medium"
-                >
-                  Export Marked
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+      {/* Hidden file input (for standalone usage when not controlled) */}
+      {!readOnlyHeader && !isControlled && (
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv"
+          className="hidden"
+          onChange={handleFile}
+        />
       )}
 
       {/* Main Content */}
@@ -638,22 +473,35 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Keyboard shortcuts */}
+                {/* Settings moved here */}
                 <div className="bg-white rounded-xl shadow-lg border border-slate-200 p-6">
-                  <h3 className="text-lg font-semibold text-slate-800 mb-4">Keyboard Shortcuts</h3>
-                  <div className="space-y-3 text-sm text-slate-600">
-                    <div className="flex items-center gap-2">
-                      <kbd className="px-2 py-1 bg-slate-100 border border-slate-300 rounded text-xs font-mono">Space</kbd>
-                      <span>flip card</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <kbd className="px-2 py-1 bg-slate-100 border border-slate-300 rounded text-xs font-mono">←</kbd>
-                      <kbd className="px-2 py-1 bg-slate-100 border border-slate-300 rounded text-xs font-mono">→</kbd>
-                      <span>navigate</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <kbd className="px-2 py-1 bg-slate-100 border border-slate-300 rounded text-xs font-mono">R</kbd>
-                      <span>mark for review</span>
+                  <h3 className="text-lg font-semibold text-slate-800 mb-4">Settings</h3>
+                  <div className="flex flex-col gap-4">
+                    <label className="flex items-center gap-3 text-sm">
+                      <input 
+                        type="checkbox" 
+                        className="accent-blue-600 w-4 h-4" 
+                        checked={shuffle} 
+                        onChange={(e) => setShuffle(e.target.checked)} 
+                      />
+                      <span className="font-medium text-slate-700">Shuffle Order</span>
+                    </label>
+                    <label className="flex items-center gap-3 text-sm">
+                      <input 
+                        type="checkbox" 
+                        className="accent-blue-600 w-4 h-4" 
+                        checked={reviewOnly} 
+                        onChange={(e) => setReviewOnly(e.target.checked)} 
+                      />
+                      <span className="font-medium text-slate-700">Review Only</span>
+                    </label>
+                    <div>
+                      <button 
+                        onClick={resetAnnotations} 
+                        className="w-full px-4 py-2 bg-red-50 text-red-700 rounded-lg hover:bg-red-100 transition-colors text-sm font-medium"
+                      >
+                        Clear All Marks
+                      </button>
                     </div>
                   </div>
                 </div>
